@@ -1,0 +1,116 @@
+name: Release
+
+run-name: "Protocol Version ${{ inputs.tag_name }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Protocol version tag (e.g. 0.1.0)"
+        required: true
+      release_name:
+        description: "The name of the release."
+        required: false
+        default: Version
+
+concurrency:
+  group: release-${{ inputs.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Validate and release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          version="$(
+            awk -F ' *= *' '
+              $1 == "version" {
+                gsub(/"/, "", $2)
+                print $2
+                exit
+              }
+            ' Cargo.toml
+          )"
+          expected_tag="${version}"
+
+          if [[ "${INPUT_TAG}" != "${expected_tag}" ]]; then
+            echo "::error::Tag ${INPUT_TAG} does not match Cargo.toml version ${expected_tag}."
+            exit 1
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Run Clippy
+        run: cargo clippy
+
+      - name: Build release notes
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          awk -v heading="## [${RELEASE_VERSION}]" '
+            index($0, heading) == 1 {
+              capture = 1
+              next
+            }
+            capture && /^## \[/ {
+              exit
+            }
+            capture {
+              print
+            }
+          ' CHANGELOG.md > release-notes.md
+
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::CHANGELOG.md does not contain release notes for ${RELEASE_VERSION}."
+            exit 1
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ steps.version.outputs.commit }}
+          RELEASE_NAME: ${{ inputs.release_name }}
+          RELEASE_TAG: ${{ inputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          release_title="${RELEASE_NAME}"
+          if [[ "${release_title}" == "Version" ]]; then
+            release_title="FluxTerm Pulse Protocol ${RELEASE_TAG}"
+          fi
+
+          gh release create "${RELEASE_TAG}" \
+            --target "${RELEASE_COMMIT}" \
+            --title "${release_title}" \
+            --notes-file release-notes.md
